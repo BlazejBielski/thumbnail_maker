@@ -1,8 +1,10 @@
 import logging
+import multiprocessing
 import os
 import time
+from multiprocessing import JoinableQueue, Value, Process
 from queue import Queue, Empty
-from threading import Thread
+from threading import Thread, Lock
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 from PIL import Image
@@ -16,18 +18,22 @@ class ThumbnailMakerService:
         self.home_dir = home_dir
         self.input_dir = self.home_dir + os.path.sep + 'incoming'
         self.output_dir = self.home_dir + os.path.sep + 'outgoing'
-        self.img_queue = Queue()
-        self.dl_queue = Queue()
+        self.img_queue = JoinableQueue()
+        self.dl_size = 0
+        self.resize_size = Value('i', 0, )
 
-    def download_image(self):
-        while not self.dl_queue.empty():
+    def download_image(self, dl_queue, dl_size_lock):
+        while not dl_queue.empty():
             try:
-                url = self.dl_queue.get(block=False)
+                url = dl_queue.get(block=False)
                 img_filename = urlparse(url).path.split('/')[-1]
                 logging.info(f'Download image {img_filename}')
-                urlretrieve(url, self.input_dir + os.path.sep + str(img_filename))
+                img_filename_ = self.input_dir + os.path.sep + str(img_filename)
+                urlretrieve(url, img_filename_)
+                with dl_size_lock:
+                    self.dl_size += os.path.getsize(img_filename_)
                 self.img_queue.put(img_filename)
-                self.dl_queue.task_done()
+                dl_queue.task_done()
             except Empty:
                 logging.info('Queue is empty')
 
@@ -58,7 +64,7 @@ class ThumbnailMakerService:
 
         logging.info('Beginning resizing images')
 
-        target_sizes = [32, 64, 200]
+        target_sizes = [32, 64, 200, 400, 500, 600, 700, 800, 1100, 1500, 2000]
 
         start = time.perf_counter()
 
@@ -74,6 +80,9 @@ class ThumbnailMakerService:
                     name, dot, extension = filename.partition('.')
                     new_filename = name + '_' + str(base_width) + dot + extension
                     img.save(self.output_dir + os.path.sep + new_filename)
+
+                    with self.resize_size.get_lock():
+                        self.resize_size.value = os.path.getsize(self.output_dir + os.path.sep + new_filename)
 
                 os.remove(self.input_dir + os.path.sep + filename)
                 logging.info(f'Done resizing image {filename}.')
@@ -92,23 +101,29 @@ class ThumbnailMakerService:
 
         start = time.perf_counter()
 
-        for url in img_url_list:
-            self.dl_queue.put(url)
+        dl_queue = Queue()
+        dl_size_lock = Lock()
 
-        num_dl_threads = 13
+        for url in img_url_list:
+            dl_queue.put(url)
+
+        num_dl_threads = 26
 
         for _ in range(num_dl_threads):
-            t = Thread(target=self.download_image)
+            t = Thread(target=self.download_image, args=(dl_queue, dl_size_lock))
             t.start()
 
-        t2 = Thread(target=self.perform_resizing)
-        t2.start()
+        num_processes = multiprocessing.cpu_count()
 
-        self.dl_queue.join()
-        self.img_queue.put(None)
+        for _ in range(num_processes):
+            p = Process(target=self.perform_resizing)
+            p.start()
 
-        t2.join()
+        dl_queue.join()
+        for _ in range(num_processes):
+            self.img_queue.put(None)
 
         stop = time.perf_counter()
 
         logging.info(f"FINISHED. Ended make_thumbnails in {stop - start} seconds.")
+        logging.info(f'Initial size of downloads {self.dl_size}. Final size of images {self.resize_size.value}')
